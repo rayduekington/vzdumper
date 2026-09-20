@@ -10,10 +10,25 @@ const MOUNT_POINT: &str = "/mnt/proxmox-backup";
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const BINARY_PATH: &str = "/usr/local/bin/vzdumper";
 const SERVICE_PATH: &str = "/etc/systemd/system/vzdumper.service";
+const STATE_PATH: &str = "/run/vzdumper/state.json";
 
 #[derive(Deserialize)]
 struct Config {
     disk_uuid: String,
+}
+
+fn write_state(state: &str, detail: &str) {
+    let _ = fs::create_dir_all("/run/vzdumper");
+    let json = format!(
+        "{{\"state\":\"{}\",\"detail\":\"{}\",\"time\":\"{}\"}}",
+        state,
+        detail,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    );
+    let _ = fs::write(STATE_PATH, json);
 }
 
 fn load_config() -> Option<Config> {
@@ -86,6 +101,7 @@ fn do_backup(device_path: &str) {
 }
 
 pub fn run() {
+    write_state("waiting_for_config", "");
     println!("vzdumper started. Waiting for valid config ...");
     let config = loop {
         if let Some(cfg) = load_config() {
@@ -96,11 +112,16 @@ pub fn run() {
     };
 
     loop {
+        write_state("waiting_for_device", &config.disk_uuid);
         let device = wait_for_device(&config.disk_uuid);
+
+        write_state("backing_up", &config.disk_uuid);
         do_backup(&device);
+
+        write_state("waiting_for_removal", &config.disk_uuid);
         wait_for_removal(&config.disk_uuid);
     }
-}
+}   
 
 pub fn install() {
     // 1. Config
