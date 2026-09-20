@@ -71,8 +71,8 @@ fn do_backup(device_path: &str) {
         .arg(MOUNT_POINT)
         .arg("--mode")
         .arg("snapshot")
-        .arg("--prune")
-        .arg("daily,5")
+        .arg("--prune-backups")
+        .arg("keep-last=5")
         .status()
         .expect("failed to execute vzdump");
 
@@ -180,4 +180,45 @@ WantedBy=multi-user.target
     } else {
         eprintln!("[install] ✗ Service is NOT running (state: {}). Check: journalctl -u vzdumper", active);
     }
+        // 6. GUI service
+    let gui_service = r#"[Unit]
+Description=vzdumper web GUI
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/vzdumper --gui
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+"#;
+    let gui_service_path = "/etc/systemd/system/vzdumper-gui.service";
+    fs::write(gui_service_path, gui_service).unwrap_or_else(|e| {
+        eprintln!("[install] Failed to write GUI service: {}", e);
+        std::process::exit(1);
+    });
+    println!("[install] GUI service written to {}", gui_service_path);
+
+    let r = Command::new("systemctl").args(["daemon-reload"]).status();
+    println!("[install] daemon-reload (gui): {:?}", r);
+
+    let r = Command::new("systemctl").args(["enable", "vzdumper-gui.service"]).status();
+    println!("[install] enable gui: {:?}", r);
+
+    let r = Command::new("systemctl").args(["start", "vzdumper-gui.service"]).status();
+    println!("[install] start gui: {:?}", r);
+
+    thread::sleep(Duration::from_secs(1));
+    let status = Command::new("systemctl")
+        .args(["is-active", "vzdumper-gui.service"])
+        .output()
+        .expect("failed to check gui status");
+    let active = String::from_utf8_lossy(&status.stdout).trim().to_string();
+    if active == "active" {
+        println!("[install] ✓ GUI is running on port 8888.");
+    } else {
+        eprintln!("[install] ✗ GUI is NOT running (state: {}). Check: journalctl -u vzdumper-gui", active);
+    }   
 }   
