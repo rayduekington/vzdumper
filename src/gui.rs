@@ -157,7 +157,6 @@ fn page(disks: &[String], targets: &[String], available: &[String], message: &st
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="50">
 <title>vzdumper</title>
 <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&family=Roboto+Mono&display=swap" rel="stylesheet">
 <style>
@@ -341,6 +340,25 @@ function toggleTheme() {{
   if (saved === 'dark') document.documentElement.setAttribute('data-theme', 'dark');
   else if (saved === 'light') document.documentElement.setAttribute('data-theme', 'light');
 }})();
+// Poll state every 5s, update status card in-place
+const statusCard = document.querySelector('.state-row');
+let lastState = '{state_icon}|{state}|{detail}|{time_str}';
+
+setInterval(async () => {{
+  try {{
+    const r = await fetch('/state');
+    const d = await r.json();
+    const key = d.icon + '|' + d.state + '|' + d.detail + '|' + d.time;
+    if (key !== lastState) {{
+      lastState = key;
+      document.querySelector('.state-icon').textContent = d.icon;
+      document.querySelector('.state-value').textContent = d.state;
+      document.querySelector('.state-value').style.color = d.color;
+      document.querySelector('.state-detail').textContent = d.detail;
+      document.querySelector('.state-time').textContent = 'updated ' + d.time;
+    }}
+  }} catch(e) {{}}
+}}, 5000);   
 </script>
 </body>
 </html>"#)
@@ -381,6 +399,49 @@ pub fn run() {
                     Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap(),
                 ),
             );
+        } else if method == Method::Get {
+    let url = request.url().to_string();
+    if url == "/state" {
+        let (state, detail, time) = read_state();
+        let state_color = match state.as_str() {
+            "backing_up" => "#e65100",
+            "waiting_for_device" => "#1565c0",
+            "waiting_for_removal" => "#2e7d32",
+            "waiting_for_config" => "#757575",
+            "backup_complete" => "#2e7d32",
+            "error" => "#d32f2f",
+            _ => "#424242",
+        };
+        let state_icon = match state.as_str() {
+            "backing_up" => "⏳",
+            "waiting_for_device" => "💽",
+            "waiting_for_removal" => "✅",
+            "waiting_for_config" => "⚙️",
+            "backup_complete" => "🎉",
+            "error" => "⚠️",
+            _ => "❓",
+        };
+        let time_str = if time > 0 {
+            let dt = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap().as_secs().saturating_sub(time);
+            if dt < 60 { format!("{}s ago", dt) }
+            else if dt < 3600 { format!("{}m ago", dt / 60) }
+            else { format!("{}h ago", dt / 3600) }
+        } else { "—".to_string() };
+
+        let json = format!(
+            "{{\"state\":\"{}\",\"detail\":\"{}\",\"time\":\"{}\",\"color\":\"{}\",\"icon\":\"{}\"}}",
+            state, detail, time_str, state_color, state_icon
+        );
+        let _ = request.respond(
+            Response::from_string(json).with_header(
+                Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap(),
+            )
+        );
+        continue;
+    }
+    // ... existing GET handler for "/" ...   
         } else if method == Method::Post {
             let mut body = String::new();
             let _ = request.as_reader().read_to_string(&mut body);
@@ -415,5 +476,5 @@ pub fn run() {
                 let _ = request.respond(Response::from_string(html));
             }
         }
-    }
+      }
 }   
