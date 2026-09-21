@@ -47,7 +47,6 @@ fn write_config(disks: &[String], targets: &[String]) -> Result<(), String> {
 
 fn get_available_targets() -> Vec<String> {
     let mut result = Vec::new();
-    // QEMU VMs
     if let Ok(entries) = std::fs::read_dir("/etc/pve/qemu-server") {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
@@ -58,7 +57,6 @@ fn get_available_targets() -> Vec<String> {
             }
         }
     }
-    // LXC containers
     if let Ok(entries) = std::fs::read_dir("/etc/pve/containers") {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
@@ -84,10 +82,8 @@ fn read_state() -> (String, String, u64) {
     }
 }
 
-fn page(disks: &[String], targets: &[String], available: &[String], message: &str) -> String {
-    let (state, detail, time) = read_state();
-
-    let state_color = match state.as_str() {
+fn state_color(state: &str) -> &'static str {
+    match state {
         "backing_up" => "#e65100",
         "waiting_for_device" => "#1565c0",
         "waiting_for_removal" => "#2e7d32",
@@ -95,9 +91,11 @@ fn page(disks: &[String], targets: &[String], available: &[String], message: &st
         "backup_complete" => "#2e7d32",
         "error" => "#d32f2f",
         _ => "#424242",
-    };
+    }
+}
 
-    let state_icon = match state.as_str() {
+fn state_icon(state: &str) -> &'static str {
+    match state {
         "backing_up" => "⏳",
         "waiting_for_device" => "💽",
         "waiting_for_removal" => "✅",
@@ -105,34 +103,31 @@ fn page(disks: &[String], targets: &[String], available: &[String], message: &st
         "backup_complete" => "🎉",
         "error" => "⚠️",
         _ => "❓",
-    };
-    let all_selected = if targets.iter().any(|t| t == "all") { "selected" } else { "" };   
-    let time_str = if time > 0 {
-        let dt = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            .saturating_sub(time);
-        if dt < 60 { format!("{}s ago", dt) }
-        else if dt < 3600 { format!("{}m ago", dt / 60) }
-        else { format!("{}h ago", dt / 3600) }
-    } else {
-        "—".to_string()
-    };
+    }
+}
+
+fn time_ago(time: u64) -> String {
+    if time == 0 { return "—".to_string(); }
+    let dt = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap().as_secs().saturating_sub(time);
+    if dt < 60 { format!("{}s ago", dt) }
+    else if dt < 3600 { format!("{}m ago", dt / 60) }
+    else { format!("{}h ago", dt / 3600) }
+}
+
+fn page(disks: &[String], targets: &[String], available: &[String], message: &str) -> String {
+    let (state, detail, time) = read_state();
+    let s_color = state_color(&state);
+    let s_icon = state_icon(&state);
+    let t_str = time_ago(time);
+    let all_selected = if targets.iter().any(|t| t == "all") { "selected" } else { "" };
 
     let mut disk_rows = String::new();
     for d in disks.iter() {
         disk_rows.push_str(&format!(
             r#"<div class="disk-row"><div class="input-container"><span class="input-label">UUID</span><input type="text" name="disk" value="{}" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"><div class="input-underline"></div></div><button type="button" class="icon-btn" onclick="this.closest('.disk-row').remove()" title="Remove">✕</button></div>"#,
             d
-        ));
-    }
-
-    let mut target_rows = String::new();
-    for t in targets.iter() {
-        target_rows.push_str(&format!(
-            r#"<div class="disk-row"><div class="input-container"><span class="input-label">ID</span><input type="text" name="target" value="{}" placeholder="100, 200, or all"><div class="input-underline"></div></div><button type="button" class="icon-btn" onclick="this.closest('.disk-row').remove()" title="Remove">✕</button></div>"#,
-            t
         ));
     }
 
@@ -209,7 +204,7 @@ body {{ font-family: 'Roboto', system-ui, sans-serif; background: var(--bg); col
 .state-row {{ display: flex; align-items: center; gap: 16px; }}
 .state-icon {{ font-size: 2rem; }}
 .state-info {{ flex: 1; }}
-.state-value {{ font-size: 1.1rem; font-weight: 500; color: {state_color}; }}
+.state-value {{ font-size: 1.1rem; font-weight: 500; color: {s_color}; }}
 .state-detail {{ font-size: .8rem; color: var(--text-secondary); margin-top: 4px; font-family: 'Roboto Mono', monospace; word-break: break-all; }}
 .state-time {{ font-size: .75rem; color: var(--text-muted); margin-top: 4px; }}
 .input-container {{ position: relative; margin-bottom: 20px; }}
@@ -248,18 +243,18 @@ body {{ font-family: 'Roboto', system-ui, sans-serif; background: var(--bg); col
 <div class="card">
   <div class="card-title">Status</div>
   <div class="state-row">
-    <div class="state-icon">{state_icon}</div>
+    <div class="state-icon">{s_icon}</div>
     <div class="state-info">
       <div class="state-value">{state}</div>
       <div class="state-detail">{detail}</div>
-      <div class="state-time">updated {time_str}</div>
+      <div class="state-time">updated {t_str}</div>
     </div>
   </div>
 </div>
 
 <div class="card">
   <div class="card-title">Backup Disks</div>
-  <form method="POST" action="/">
+  <form method="POST" action="/" id="mainForm">
     <div id="disks">{disk_rows}</div>
     <button type="button" class="btn btn-text" onclick="addDisk()">+ Add disk</button>
 
@@ -268,10 +263,9 @@ body {{ font-family: 'Roboto', system-ui, sans-serif; background: var(--bg); col
     <div class="card-title" style="margin-top:8px">Backup Targets</div>
     <p style="font-size:.8rem;color:var(--text-muted);margin-bottom:12px">Click a chip to toggle. Use "all" to backup everything.</p>
     <div class="chips" id="chips">
-    <span class="chip {all_selected}" onclick="toggleTarget(this, 'all')">all</span>         {available_chips}
+      <span class="chip {all_selected}" onclick="toggleTarget(this, 'all')">all</span>
+      {available_chips}
     </div>
-    <div id="targets">{target_rows}</div>
-    <button type="button" class="btn btn-text" onclick="addTarget()">+ Add target</button>
 
     <br><br>
     <button type="submit" class="btn btn-primary">Save</button>
@@ -280,7 +274,7 @@ body {{ font-family: 'Roboto', system-ui, sans-serif; background: var(--bg); col
 
 {msg_html}
 
-<div class="footer">Auto-refreshes every 5 s · Daemon picks up changes within ~10 s</div>
+<div class="footer">Status updates every 5 s · Daemon picks up changes within ~10 s</div>
 
 </div>
 <script>
@@ -290,41 +284,14 @@ function addDisk() {{
   div.innerHTML = '<div class="input-container"><span class="input-label">UUID</span><input type="text" name="disk" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"><div class="input-underline"></div></div><button type="button" class="icon-btn" onclick="this.closest(\'.disk-row\').remove()">✕</button>';
   document.getElementById('disks').appendChild(div);
 }}
-function addTarget() {{
-  const div = document.createElement('div');
-  div.className = 'disk-row';
-  div.innerHTML = '<div class="input-container"><span class="input-label">ID</span><input type="text" name="target" placeholder="100, 200, or all"><div class="input-underline"></div></div><button type="button" class="icon-btn" onclick="this.closest(\'.disk-row\').remove()">✕</button>';
-  document.getElementById('targets').appendChild(div);
-}}
 function toggleTarget(el, id) {{
   el.classList.toggle('selected');
-  // Sync: if "all" is selected, deselect others and vice versa
   const chips = document.querySelectorAll('#chips .chip');
   if (id === 'all' && el.classList.contains('selected')) {{
     chips.forEach(c => {{ if (c !== el) c.classList.remove('selected'); }});
   }} else if (id !== 'all') {{
     const allChip = document.querySelector('#chips .chip:first-child');
     if (allChip) allChip.classList.remove('selected');
-  }}
-  // Update hidden inputs
-  syncTargets();
-}}
-function syncTargets() {{
-  // Remove old hidden inputs
-  document.querySelectorAll('input[name="target"]').forEach(el => el.remove());
-  // Add selected chips as hidden inputs
-  const form = document.querySelector('form');
-  const selected = document.querySelectorAll('#chips .chip.selected');
-  if (selected.length === 0) {{
-    const input = document.createElement('input');
-    input.type = 'hidden'; input.name = 'target'; input.value = 'all';
-    form.insertBefore(input, form.querySelector('button[type=submit]'));
-  }} else {{
-    selected.forEach(chip => {{
-      const input = document.createElement('input');
-      input.type = 'hidden'; input.name = 'target'; input.value = chip.textContent;
-      form.insertBefore(input, form.querySelector('button[type=submit]'));
-    }});
   }}
 }}
 function toggleTheme() {{
@@ -340,10 +307,28 @@ function toggleTheme() {{
   if (saved === 'dark') document.documentElement.setAttribute('data-theme', 'dark');
   else if (saved === 'light') document.documentElement.setAttribute('data-theme', 'light');
 }})();
-// Poll state every 5s, update status card in-place
-const statusCard = document.querySelector('.state-row');
-let lastState = '{state_icon}|{state}|{detail}|{time_str}';
 
+document.getElementById('mainForm').addEventListener('submit', function(e) {{
+  this.querySelectorAll('input[name="target"][data-chip]').forEach(el => el.remove());
+  const selected = document.querySelectorAll('#chips .chip.selected');
+  const allSelected = selected.length > 0 && selected[0].textContent === 'all';
+  const chips = allSelected ? [selected[0]] : Array.from(selected);
+  if (chips.length === 0) {{
+    const input = document.createElement('input');
+    input.type = 'hidden'; input.name = 'target'; input.value = 'all';
+    input.setAttribute('data-chip', '1');
+    this.appendChild(input);
+  }} else {{
+    chips.forEach(chip => {{
+      const input = document.createElement('input');
+      input.type = 'hidden'; input.name = 'target'; input.value = chip.textContent;
+      input.setAttribute('data-chip', '1');
+      this.appendChild(input);
+    }});
+  }}
+}});
+
+let lastState = '{s_icon}|{state}|{detail}|{t_str}';
 setInterval(async () => {{
   try {{
     const r = await fetch('/state');
@@ -358,7 +343,7 @@ setInterval(async () => {{
       document.querySelector('.state-time').textContent = 'updated ' + d.time;
     }}
   }} catch(e) {{}}
-}}, 5000);   
+}}, 5000);
 </script>
 </body>
 </html>"#)
@@ -391,6 +376,22 @@ pub fn run() {
         let method = request.method().clone();
 
         if method == Method::Get {
+            let url = request.url().to_string();
+
+            if url == "/state" {
+                let (state, detail, time) = read_state();
+                let json = format!(
+                    "{{\"state\":\"{}\",\"detail\":\"{}\",\"time\":\"{}\",\"color\":\"{}\",\"icon\":\"{}\"}}",
+                    state, detail, time_ago(time), state_color(&state), state_icon(&state)
+                );
+                let _ = request.respond(
+                    Response::from_string(json).with_header(
+                        Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap(),
+                    )
+                );
+                continue;
+            }
+
             let (disks, targets) = read_config();
             let available = get_available_targets();
             let html = page(&disks, &targets, &available, "");
@@ -399,49 +400,6 @@ pub fn run() {
                     Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap(),
                 ),
             );
-        } else if method == Method::Get {
-    let url = request.url().to_string();
-    if url == "/state" {
-        let (state, detail, time) = read_state();
-        let state_color = match state.as_str() {
-            "backing_up" => "#e65100",
-            "waiting_for_device" => "#1565c0",
-            "waiting_for_removal" => "#2e7d32",
-            "waiting_for_config" => "#757575",
-            "backup_complete" => "#2e7d32",
-            "error" => "#d32f2f",
-            _ => "#424242",
-        };
-        let state_icon = match state.as_str() {
-            "backing_up" => "⏳",
-            "waiting_for_device" => "💽",
-            "waiting_for_removal" => "✅",
-            "waiting_for_config" => "⚙️",
-            "backup_complete" => "🎉",
-            "error" => "⚠️",
-            _ => "❓",
-        };
-        let time_str = if time > 0 {
-            let dt = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap().as_secs().saturating_sub(time);
-            if dt < 60 { format!("{}s ago", dt) }
-            else if dt < 3600 { format!("{}m ago", dt / 60) }
-            else { format!("{}h ago", dt / 3600) }
-        } else { "—".to_string() };
-
-        let json = format!(
-            "{{\"state\":\"{}\",\"detail\":\"{}\",\"time\":\"{}\",\"color\":\"{}\",\"icon\":\"{}\"}}",
-            state, detail, time_str, state_color, state_icon
-        );
-        let _ = request.respond(
-            Response::from_string(json).with_header(
-                Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap(),
-            )
-        );
-        continue;
-    }
-    // ... existing GET handler for "/" ...   
         } else if method == Method::Post {
             let mut body = String::new();
             let _ = request.as_reader().read_to_string(&mut body);
@@ -460,21 +418,22 @@ pub fn run() {
                 }
             }
 
-            if disks.is_empty() {
+            let available = get_available_targets();
+            let html = if disks.is_empty() {
                 let (d, t) = read_config();
-                let available = get_available_targets();
-                let html = page(&d, &t, &available, "Error: at least one disk required");
-                let _ = request.respond(Response::from_string(html));
+                page(&d, &t, &available, "Error: at least one disk required")
             } else if let Err(e) = write_config(&disks, &targets) {
-                let available = get_available_targets();
-                let html = page(&disks, &targets, &available, &format!("Error: {}", e));
-                let _ = request.respond(Response::from_string(html));
+                page(&disks, &targets, &available, &format!("Error: {}", e))
             } else {
                 println!("Config saved: disks={:?}, targets={:?}", disks, targets);
-                let available = get_available_targets();
-                let html = page(&disks, &targets, &available, "Saved ✓");
-                let _ = request.respond(Response::from_string(html));
-            }
+                page(&disks, &targets, &available, "Saved ✓")
+            };
+
+            let _ = request.respond(
+                Response::from_string(html).with_header(
+                    Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap(),
+                ),
+            );
         }
-      }
+    }
 }   
