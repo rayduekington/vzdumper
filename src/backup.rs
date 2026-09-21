@@ -1,11 +1,10 @@
 use serde::Deserialize;
 use std::fs;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::Path;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
-use std::os::unix::fs::FileTypeExt;   
 
 const CONFIG_PATH: &str = "/root/.config/vzdumper/config.yaml";
 const MOUNT_POINT: &str = "/mnt/proxmox-backup";
@@ -18,6 +17,12 @@ const STATE_PATH: &str = "/run/vzdumper/state.json";
 #[derive(Deserialize)]
 struct Config {
     disks: Vec<String>,
+    #[serde(default = "default_targets")]
+    targets: Vec<String>,
+}
+
+fn default_targets() -> Vec<String> {
+    vec!["all".to_string()]
 }
 
 fn load_config() -> Option<Config> {
@@ -45,14 +50,9 @@ fn write_state(state: &str, detail: &str) {
     let _ = fs::write(STATE_PATH, json);
 }
 
-/// Check if the path is a real, ready block device (not just a dangling symlink)
 fn is_block_device(path: &str) -> bool {
     match fs::metadata(path) {
-        Ok(meta) => {
-            // S_IFBLK = 0o060000 for block device special files
-            let file_type = meta.file_type();
-            file_type.is_block_device()
-        }
+        Ok(meta) => meta.file_type().is_block_device(),
         Err(_) => false,
     }
 }
@@ -80,25 +80,20 @@ fn wait_for_removal(uuid: &str) {
     }
 }
 
-fn do_backup(device_path: &str) {
+fn do_backup(device_path: &str, targets: &[String]) {
     fs::create_dir_all(MOUNT_POINT).expect("failed to create mount point");
 
-    // Wait for the block device to be fully ready (retry up to 30s)
     for attempt in 0..6 {
-        if is_block_device(device_path) {
-            break;
-        }
+        if is_block_device(device_path) { break; }
         println!("Device not ready yet, retrying in 5s... ({})", attempt + 1);
         thread::sleep(POLL_INTERVAL);
     }
 
     if !is_block_device(device_path) {
         write_state("error", &format!("device {} not available", device_path));
-        eprintln!("Device {} is not a valid block device.", device_path);
         return;
     }
 
-    // Check if already mounted
     let mount_output = Command::new("findmnt")
         .arg(MOUNT_POINT)
         .output()
@@ -117,7 +112,6 @@ fn do_backup(device_path: &str) {
         if !mount.status.success() {
             let err = String::from_utf8_lossy(&mount.stderr).trim().to_string();
             write_state("error", &format!("mount failed: {}", err));
-            eprintln!("mount failed: {}", err);
             return;
         }
         println!("Mounted at {}", MOUNT_POINT);
@@ -125,19 +119,22 @@ fn do_backup(device_path: &str) {
 
     write_state("backing_up", device_path);
 
-    let vzdump = Command::new("vzdump")
-        .arg("--all")
-        .arg("--dumpdir")
-        .arg(MOUNT_POINT)
-        .arg("--mode")
-        .arg("snapshot")
-        .output()
-        .expect("failed to execute vzdump");
+    // Build vzdump command
+    let mut cmd = Command::new("vzdump");
+    if targets.iter().any(|t| t == "all") {
+        cmd.arg("--all");
+    } else {
+        for t in targets {
+            cmd.arg(t);
+        }
+    }
+    cmd.arg("--dumpdir").arg(MOUNT_POINT).arg("--mode").arg("snapshot");
+
+    let vzdump = cmd.output().expect("failed to execute vzdump");
 
     let _ = Command::new("umount").arg(MOUNT_POINT).status();
 
     if vzdump.status.success() {
-        // Manual prune: keep last 5 backup directories
         let prune = Command::new("bash")
             .args(["-c", &format!(
                 "ls -dt {}/vzdump-* 2>/dev/null | tail -n +6 | xargs -r rm -rf",
@@ -164,7 +161,7 @@ pub fn run() {
     println!("vzdumper started. Waiting for valid config ...");
     let config = loop {
         if let Some(cfg) = load_config() {
-            println!("Config loaded: {} disk(s).", cfg.disks.len());
+            println!("Config loaded: {} disk(s), targets: {:?}", cfg.disks.len(), cfg.targets);
             break cfg;
         }
         thread::sleep(Duration::from_secs(10));
@@ -179,7 +176,7 @@ pub fn run() {
             thread::sleep(POLL_INTERVAL);
         };
 
-        do_backup(&device);
+        do_backup(&device, &config.targets);
         thread::sleep(Duration::from_secs(5));
 
         let uuid = device.rsplit('/').next().unwrap_or("");
@@ -189,7 +186,6 @@ pub fn run() {
 }
 
 pub fn install() {
-    // 1. Config
     let config_dir = Path::new("/root/.config/vzdumper");
     fs::create_dir_all(config_dir).unwrap_or_else(|e| {
         eprintln!("[install] Failed to create config dir: {}", e);
@@ -197,17 +193,16 @@ pub fn install() {
     });
     let config_file = config_dir.join("config.yaml");
     if !config_file.exists() {
-        fs::write(&config_file, "disks:\n  - \"\"\n").unwrap_or_else(|e| {
+        fs::write(&config_file, "disks:\n  - \"\"\ntargets: \"all\"\n").unwrap_or_else(|e| {
             eprintln!("[install] Failed to write config: {}", e);
             std::process::exit(1);
         });
         println!("[install] Created config at {}", config_file.display());
-        println!("[install]   → Edit it to set your disk UUID(s).");
     } else {
         println!("[install] Config already exists at {}", config_file.display());
     }
 
-    // 1b. Migrate old format
+    // Migrate old format
     if config_file.exists() {
         let content = fs::read_to_string(&config_file).unwrap_or_default();
         if content.contains("disk_uuid:") && !content.contains("disks:") {
@@ -216,7 +211,7 @@ pub fn install() {
                 .find(|l| l.trim_start().starts_with("disk_uuid:"))
                 .and_then(|l| l.split_once(':').map(|(_, v)| v.trim().trim_matches('"').to_string()))
                 .unwrap_or_default();
-            let new_yaml = format!("disks:\n  - \"{}\"\n", uuid);
+            let new_yaml = format!("disks:\n  - \"{}\"\ntargets: \"all\"\n", uuid);
             fs::write(&config_file, new_yaml).unwrap_or_else(|e| {
                 eprintln!("[install] Failed to migrate config: {}", e);
                 std::process::exit(1);
@@ -225,7 +220,6 @@ pub fn install() {
         }
     }
 
-    // 2. Copy binary
     let self_path = std::env::current_exe().unwrap_or_else(|e| {
         eprintln!("[install] Failed to get self path: {}", e);
         std::process::exit(1);
@@ -235,14 +229,13 @@ pub fn install() {
         eprintln!("[install] Failed to copy binary: {}", e);
         std::process::exit(1);
     });
-    fs::set_permissions(BINARY_PATH, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+    fs::set_permissions(BINARY_PATH, PermissionsExt::from_mode(0o755))
         .unwrap_or_else(|e| {
             eprintln!("[install] Failed to chmod: {}", e);
             std::process::exit(1);
         });
     println!("[install] Binary installed at {}", BINARY_PATH);
 
-    // 3. Daemon service
     let service = r#"[Unit]
 Description=vzdumper - Proxmox backup on disk insert
 After=local-fs.target
@@ -260,9 +253,7 @@ WantedBy=multi-user.target
         eprintln!("[install] Failed to write service: {}", e);
         std::process::exit(1);
     });
-    println!("[install] Service written to {}", SERVICE_PATH);
 
-    // 4. GUI service
     let gui_service = r#"[Unit]
 Description=vzdumper web GUI
 After=network.target
@@ -280,25 +271,18 @@ WantedBy=multi-user.target
         eprintln!("[install] Failed to write GUI service: {}", e);
         std::process::exit(1);
     });
-    println!("[install] GUI service written to {}", GUI_SERVICE_PATH);
 
-    // 5. Reload & start
     let r = Command::new("systemctl").args(["daemon-reload"]).status();
     println!("[install] daemon-reload: {:?}", r);
-
     let r = Command::new("systemctl").args(["enable", "vzdumper.service"]).status();
     println!("[install] enable daemon: {:?}", r);
-
     let r = Command::new("systemctl").args(["start", "vzdumper.service"]).status();
     println!("[install] start daemon: {:?}", r);
-
     let r = Command::new("systemctl").args(["enable", "vzdumper-gui.service"]).status();
     println!("[install] enable gui: {:?}", r);
-
     let r = Command::new("systemctl").args(["start", "vzdumper-gui.service"]).status();
     println!("[install] start gui: {:?}", r);
 
-    // 6. Verify
     thread::sleep(Duration::from_secs(2));
     for svc in ["vzdumper.service", "vzdumper-gui.service"] {
         let status = Command::new("systemctl")
@@ -309,8 +293,8 @@ WantedBy=multi-user.target
         if active == "active" {
             println!("[install] ✓ {} is running.", svc);
         } else {
-            eprintln!("[install] ✗ {} is NOT running (state: {}). Check: journalctl -u {}", svc, active, svc);
+            eprintln!("[install] ✗ {} is NOT running (state: {}).", svc, active);
         }
     }
-    println!("[install] GUI available at http://<proxmox-ip>:8888");
+    println!("[install] GUI available at https://<proxmox-ip>:8889");
 }   
