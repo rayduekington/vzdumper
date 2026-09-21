@@ -1,5 +1,4 @@
 use tiny_http::{Server, Response, Header, Method};
-use std::io::Read;
 
 const CONFIG_PATH: &str = "/root/.config/vzdumper/config.yaml";
 const STATE_PATH: &str = "/run/vzdumper/state.json";
@@ -54,6 +53,8 @@ fn page(disks: &[String], message: &str) -> String {
         "waiting_for_device" => "#1565c0",
         "waiting_for_removal" => "#2e7d32",
         "waiting_for_config" => "#757575",
+        "backup_complete" => "#2e7d32",
+        "error" => "#d32f2f",
         _ => "#424242",
     };
 
@@ -62,6 +63,8 @@ fn page(disks: &[String], message: &str) -> String {
         "waiting_for_device" => "💽",
         "waiting_for_removal" => "✅",
         "waiting_for_config" => "⚙️",
+        "backup_complete" => "🎉",
+        "error" => "⚠️",
         _ => "❓",
     };
 

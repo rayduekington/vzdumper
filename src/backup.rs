@@ -1,9 +1,11 @@
 use serde::Deserialize;
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
+use std::os::unix::fs::FileTypeExt;   
 
 const CONFIG_PATH: &str = "/root/.config/vzdumper/config.yaml";
 const MOUNT_POINT: &str = "/mnt/proxmox-backup";
@@ -43,10 +45,22 @@ fn write_state(state: &str, detail: &str) {
     let _ = fs::write(STATE_PATH, json);
 }
 
+/// Check if the path is a real, ready block device (not just a dangling symlink)
+fn is_block_device(path: &str) -> bool {
+    match fs::metadata(path) {
+        Ok(meta) => {
+            // S_IFBLK = 0o060000 for block device special files
+            let file_type = meta.file_type();
+            file_type.is_block_device()
+        }
+        Err(_) => false,
+    }
+}
+
 fn wait_for_any_device(uuids: &[String]) -> Option<String> {
     for uuid in uuids {
         let path = format!("/dev/disk/by-uuid/{}", uuid);
-        if Path::new(&path).exists() {
+        if is_block_device(&path) {
             println!("Device found: {}", path);
             return Some(path);
         }
@@ -69,16 +83,47 @@ fn wait_for_removal(uuid: &str) {
 fn do_backup(device_path: &str) {
     fs::create_dir_all(MOUNT_POINT).expect("failed to create mount point");
 
-    let mount = Command::new("mount")
-        .arg(device_path)
-        .arg(MOUNT_POINT)
-        .status()
-        .expect("failed to execute mount");
-    if !mount.success() {
-        eprintln!("mount failed");
+    // Wait for the block device to be fully ready (retry up to 30s)
+    for attempt in 0..6 {
+        if is_block_device(device_path) {
+            break;
+        }
+        println!("Device not ready yet, retrying in 5s... ({})", attempt + 1);
+        thread::sleep(POLL_INTERVAL);
+    }
+
+    if !is_block_device(device_path) {
+        write_state("error", &format!("device {} not available", device_path));
+        eprintln!("Device {} is not a valid block device.", device_path);
         return;
     }
-    println!("Mounted at {}", MOUNT_POINT);
+
+    // Check if already mounted
+    let mount_output = Command::new("findmnt")
+        .arg(MOUNT_POINT)
+        .output()
+        .expect("failed to run findmnt");
+    let already_mounted = mount_output.status.success()
+        && String::from_utf8_lossy(&mount_output.stdout).contains(device_path);
+
+    if already_mounted {
+        println!("Already mounted at {}", MOUNT_POINT);
+    } else {
+        let mount = Command::new("mount")
+            .arg(device_path)
+            .arg(MOUNT_POINT)
+            .output()
+            .expect("failed to execute mount");
+        if !mount.status.success() {
+            let err = String::from_utf8_lossy(&mount.stderr).trim().to_string();
+            write_state("error", &format!("mount failed: {}", err));
+            eprintln!("mount failed: {}", err);
+            return;
+        }
+        println!("Mounted at {}", MOUNT_POINT);
+    }
+
+    write_state("backing_up", device_path);
 
     let vzdump = Command::new("vzdump")
         .arg("--all")
@@ -86,17 +131,31 @@ fn do_backup(device_path: &str) {
         .arg(MOUNT_POINT)
         .arg("--mode")
         .arg("snapshot")
-        .arg("--prune")
-        .arg("daily,5")
-        .status()
+        .output()
         .expect("failed to execute vzdump");
 
     let _ = Command::new("umount").arg(MOUNT_POINT).status();
 
-    if vzdump.success() {
+    if vzdump.status.success() {
+        // Manual prune: keep last 5 backup directories
+        let prune = Command::new("bash")
+            .args(["-c", &format!(
+                "ls -dt {}/vzdump-* 2>/dev/null | tail -n +6 | xargs -r rm -rf",
+                MOUNT_POINT
+            )])
+            .output()
+            .expect("failed to prune");
+        if !prune.status.success() {
+            let err = String::from_utf8_lossy(&prune.stderr).trim().to_string();
+            eprintln!("prune warning: {}", err);
+        }
+
+        write_state("backup_complete", device_path);
         println!("Backup complete.");
     } else {
-        eprintln!("vzdump failed.");
+        let err = String::from_utf8_lossy(&vzdump.stderr).trim().to_string();
+        write_state("error", &format!("vzdump failed: {}", err));
+        eprintln!("vzdump failed: {}", err);
     }
 }
 
@@ -120,8 +179,8 @@ pub fn run() {
             thread::sleep(POLL_INTERVAL);
         };
 
-        write_state("backing_up", &device);
         do_backup(&device);
+        thread::sleep(Duration::from_secs(5));
 
         let uuid = device.rsplit('/').next().unwrap_or("");
         write_state("waiting_for_removal", uuid);
@@ -146,6 +205,24 @@ pub fn install() {
         println!("[install]   → Edit it to set your disk UUID(s).");
     } else {
         println!("[install] Config already exists at {}", config_file.display());
+    }
+
+    // 1b. Migrate old format
+    if config_file.exists() {
+        let content = fs::read_to_string(&config_file).unwrap_or_default();
+        if content.contains("disk_uuid:") && !content.contains("disks:") {
+            let uuid = content
+                .lines()
+                .find(|l| l.trim_start().starts_with("disk_uuid:"))
+                .and_then(|l| l.split_once(':').map(|(_, v)| v.trim().trim_matches('"').to_string()))
+                .unwrap_or_default();
+            let new_yaml = format!("disks:\n  - \"{}\"\n", uuid);
+            fs::write(&config_file, new_yaml).unwrap_or_else(|e| {
+                eprintln!("[install] Failed to migrate config: {}", e);
+                std::process::exit(1);
+            });
+            println!("[install] Migrated config to new format.");
+        }
     }
 
     // 2. Copy binary
