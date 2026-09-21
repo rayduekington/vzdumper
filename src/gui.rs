@@ -366,29 +366,45 @@ setInterval(async () => {{
 </html>"#)
 }
 
-fn load_ssl_config() -> SslConfig {
+fn load_ssl_config() -> Option<SslConfig> {
     let (cert_path, key_path) = if std::path::Path::new("/etc/pve/local/pveproxy-ssl.pem").exists() {
         ("/etc/pve/local/pveproxy-ssl.pem", "/etc/pve/local/pveproxy-ssl.key")
-    } else {
+    } else if std::path::Path::new("/etc/pve/local/pve-ssl.pem").exists() {
         ("/etc/pve/local/pve-ssl.pem", "/etc/pve/local/pve-ssl.key")
+    } else {
+        eprintln!("No TLS certificate found. Falling back to plain HTTP.");
+        return None;
     };
-    let certificate = std::fs::read(cert_path).unwrap_or_else(|e| {
-        eprintln!("Failed to read cert {}: {}", cert_path, e);
-        std::process::exit(1);
-    });
-    let private_key = std::fs::read(key_path).unwrap_or_else(|e| {
-        eprintln!("Failed to read key {}: {}", key_path, e);
-        std::process::exit(1);
-    });
+
+    let certificate = match std::fs::read(cert_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to read cert {}: {}. Falling back to plain HTTP.", cert_path, e);
+            return None;
+        }
+    };
+    let private_key = match std::fs::read(key_path) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("Failed to read key {}: {}. Falling back to plain HTTP.", key_path, e);
+            return None;
+        }
+    };
+
     println!("Using TLS cert: {}", cert_path);
-    SslConfig { certificate, private_key }
+    Some(SslConfig { certificate, private_key })
 }
 
 pub fn run() {
     let ssl_config = load_ssl_config();
-    let server = Server::https(LISTEN_ADDR, ssl_config).expect("failed to bind HTTPS server");
-    println!("GUI listening on https://{} (Ctrl+C to stop)", LISTEN_ADDR);
-
+    let server = match &ssl_config {
+        Some(config) => Server::https(LISTEN_ADDR, config.clone())
+            .expect("failed to bind HTTPS server"),
+        None => Server::http(LISTEN_ADDR)
+            .expect("failed to bind HTTP server"),
+    };
+    let scheme = if ssl_config.is_some() { "https" } else { "http" };
+    println!("[install] GUI available at http(s)://<proxmox-ip>:8889");
     for mut request in server.incoming_requests() {
         let method = request.method().clone();
 
