@@ -19,10 +19,16 @@ struct Config {
     disks: Vec<String>,
     #[serde(default = "default_targets")]
     targets: Vec<String>,
+    #[serde(default = "default_keep_last")]
+    keep_last: u32,
 }
 
 fn default_targets() -> Vec<String> {
     vec!["all".to_string()]
+}
+
+fn default_keep_last() -> u32 {
+    5
 }
 
 fn load_config() -> Option<Config> {
@@ -80,7 +86,7 @@ fn wait_for_removal(uuid: &str) {
     }
 }
 
-fn do_backup(device_path: &str, targets: &[String]) {
+fn do_backup(device_path: &str, targets: &[String], keep_last: u32) {
     fs::create_dir_all(MOUNT_POINT).expect("failed to create mount point");
 
     for attempt in 0..6 {
@@ -119,7 +125,6 @@ fn do_backup(device_path: &str, targets: &[String]) {
 
     write_state("backing_up", device_path);
 
-    // Build vzdump command
     let mut cmd = Command::new("vzdump");
     if targets.iter().any(|t| t == "all") {
         cmd.arg("--all");
@@ -137,8 +142,9 @@ fn do_backup(device_path: &str, targets: &[String]) {
     if vzdump.status.success() {
         let prune = Command::new("bash")
             .args(["-c", &format!(
-                "ls -dt {}/vzdump-* 2>/dev/null | tail -n +6 | xargs -r rm -rf",
-                MOUNT_POINT
+                "ls -dt {}/vzdump-* 2>/dev/null | tail -n +{} | xargs -r rm -rf",
+                MOUNT_POINT,
+                keep_last + 1
             )])
             .output()
             .expect("failed to prune");
@@ -148,7 +154,7 @@ fn do_backup(device_path: &str, targets: &[String]) {
         }
 
         write_state("backup_complete", device_path);
-        println!("Backup complete.");
+        println!("Backup complete. Kept last {} backups.", keep_last);
     } else {
         let err = String::from_utf8_lossy(&vzdump.stderr).trim().to_string();
         write_state("error", &format!("vzdump failed: {}", err));
@@ -161,7 +167,7 @@ pub fn run() {
     println!("vzdumper started. Waiting for valid config ...");
     let config = loop {
         if let Some(cfg) = load_config() {
-            println!("Config loaded: {} disk(s), targets: {:?}", cfg.disks.len(), cfg.targets);
+            println!("Config loaded: {} disk(s), targets: {:?}, keep_last: {}", cfg.disks.len(), cfg.targets, cfg.keep_last);
             break cfg;
         }
         thread::sleep(Duration::from_secs(10));
@@ -176,7 +182,7 @@ pub fn run() {
             thread::sleep(POLL_INTERVAL);
         };
 
-        do_backup(&device, &config.targets);
+        do_backup(&device, &config.targets, config.keep_last);
         thread::sleep(Duration::from_secs(5));
 
         let uuid = device.rsplit('/').next().unwrap_or("");
@@ -193,7 +199,7 @@ pub fn install() {
     });
     let config_file = config_dir.join("config.yaml");
     if !config_file.exists() {
-        fs::write(&config_file, "disks:\n  - \"\"\ntargets: \"all\"\n").unwrap_or_else(|e| {
+        fs::write(&config_file, "disks:\n  - \"\"\ntargets:\n  - \"all\"\nkeep_last: 5\n").unwrap_or_else(|e| {
             eprintln!("[install] Failed to write config: {}", e);
             std::process::exit(1);
         });
@@ -202,7 +208,6 @@ pub fn install() {
         println!("[install] Config already exists at {}", config_file.display());
     }
 
-    // Migrate old format
     if config_file.exists() {
         let content = fs::read_to_string(&config_file).unwrap_or_default();
         if content.contains("disk_uuid:") && !content.contains("disks:") {
@@ -211,7 +216,7 @@ pub fn install() {
                 .find(|l| l.trim_start().starts_with("disk_uuid:"))
                 .and_then(|l| l.split_once(':').map(|(_, v)| v.trim().trim_matches('"').to_string()))
                 .unwrap_or_default();
-            let new_yaml = format!("disks:\n  - \"{}\"\ntargets: \"all\"\n", uuid);
+            let new_yaml = format!("disks:\n  - \"{}\"\ntargets:\n  - \"all\"\nkeep_last: 5\n", uuid);
             fs::write(&config_file, new_yaml).unwrap_or_else(|e| {
                 eprintln!("[install] Failed to migrate config: {}", e);
                 std::process::exit(1);
@@ -297,4 +302,4 @@ WantedBy=multi-user.target
         }
     }
     println!("[install] GUI available at https://<proxmox-ip>:8889");
-}   
+}

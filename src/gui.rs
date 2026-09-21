@@ -5,9 +5,10 @@ const CONFIG_PATH: &str = "/root/.config/vzdumper/config.yaml";
 const STATE_PATH: &str = "/run/vzdumper/state.json";
 const LISTEN_ADDR: &str = "0.0.0.0:8889";
 
-fn read_config() -> (Vec<String>, Vec<String>) {
+fn read_config() -> (Vec<String>, Vec<String>, u32) {
     let mut disks = Vec::new();
     let mut targets = vec!["all".to_string()];
+    let mut keep_last: u32 = 5;
 
     if let Ok(content) = std::fs::read_to_string(CONFIG_PATH) {
         let v: serde_yaml::Value = serde_yaml::from_str(&content).unwrap_or_default();
@@ -27,11 +28,14 @@ fn read_config() -> (Vec<String>, Vec<String>) {
                     .collect();
             }
         }
+        if let Some(k) = v.get("keep_last").and_then(|k| k.as_u64()) {
+            keep_last = k as u32;
+        }
     }
-    (disks, targets)
+    (disks, targets, keep_last)
 }
 
-fn write_config(disks: &[String], targets: &[String]) -> Result<(), String> {
+fn write_config(disks: &[String], targets: &[String], keep_last: u32) -> Result<(), String> {
     let dir = std::path::Path::new("/root/.config/vzdumper");
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let mut yaml = String::from("disks:\n");
@@ -42,6 +46,7 @@ fn write_config(disks: &[String], targets: &[String]) -> Result<(), String> {
     for t in targets {
         yaml.push_str(&format!("  - \"{}\"\n", t));
     }
+    yaml.push_str(&format!("keep_last: {}\n", keep_last));
     std::fs::write(CONFIG_PATH, yaml).map_err(|e| e.to_string())
 }
 
@@ -116,7 +121,7 @@ fn time_ago(time: u64) -> String {
     else { format!("{}h ago", dt / 3600) }
 }
 
-fn page(disks: &[String], targets: &[String], available: &[String], message: &str) -> String {
+fn page(disks: &[String], targets: &[String], keep_last: u32, available: &[String], message: &str) -> String {
     let (state, detail, time) = read_state();
     let s_color = state_color(&state);
     let s_icon = state_icon(&state);
@@ -229,6 +234,10 @@ body {{ font-family: 'Roboto', system-ui, sans-serif; background: var(--bg); col
 .chip:hover {{ opacity: .8; }}
 .chip.selected {{ background: var(--chip-selected); color: #fff; }}
 .section-divider {{ border: none; border-top: 1px solid var(--input-border); margin: 20px 0; }}
+.keep-last-row {{ display: flex; align-items: center; gap: 12px; margin-top: 16px; }}
+.keep-last-row label {{ font-size: .85rem; color: var(--text-secondary); font-weight: 500; }}
+.keep-last-row input {{ width: 60px; padding: 8px; border: 1px solid var(--input-border); border-radius: 6px; font-size: 1rem; font-family: 'Roboto Mono', monospace; text-align: center; background: transparent; color: var(--text); outline: none; }}
+.keep-last-row input:focus {{ border-color: var(--input-focus); }}
 </style>
 </head>
 <body>
@@ -265,6 +274,14 @@ body {{ font-family: 'Roboto', system-ui, sans-serif; background: var(--bg); col
     <div class="chips" id="chips">
       <span class="chip {all_selected}" onclick="toggleTarget(this, 'all')">all</span>
       {available_chips}
+    </div>
+
+    <hr class="section-divider">
+
+    <div class="keep-last-row">
+      <label for="keep_last">Keep last</label>
+      <input type="number" id="keep_last" name="keep_last" value="{keep_last}" min="1" max="99">
+      <span style="font-size:.8rem;color:var(--text-muted)">backups</span>
     </div>
 
     <br><br>
@@ -392,9 +409,9 @@ pub fn run() {
                 continue;
             }
 
-            let (disks, targets) = read_config();
+            let (disks, targets, keep_last) = read_config();
             let available = get_available_targets();
-            let html = page(&disks, &targets, &available, "");
+            let html = page(&disks, &targets, keep_last, &available, "");
             let _ = request.respond(
                 Response::from_string(html).with_header(
                     Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap(),
@@ -406,6 +423,7 @@ pub fn run() {
 
             let mut disks = Vec::new();
             let mut targets = Vec::new();
+            let mut keep_last: u32 = 5;
             for pair in body.split('&') {
                 let mut kv = pair.splitn(2, '=');
                 let k = kv.next().unwrap_or("");
@@ -415,18 +433,22 @@ pub fn run() {
                     disks.push(v);
                 } else if k == "target" && !v.is_empty() {
                     targets.push(v);
+                } else if k == "keep_last" {
+                    if let Ok(n) = v.parse::<u32>() {
+                        keep_last = n.clamp(1, 99);
+                    }
                 }
             }
 
             let available = get_available_targets();
             let html = if disks.is_empty() {
-                let (d, t) = read_config();
-                page(&d, &t, &available, "Error: at least one disk required")
-            } else if let Err(e) = write_config(&disks, &targets) {
-                page(&disks, &targets, &available, &format!("Error: {}", e))
+                let (d, t, k) = read_config();
+                page(&d, &t, k, &available, "Error: at least one disk required")
+            } else if let Err(e) = write_config(&disks, &targets, keep_last) {
+                page(&disks, &targets, keep_last, &available, &format!("Error: {}", e))
             } else {
-                println!("Config saved: disks={:?}, targets={:?}", disks, targets);
-                page(&disks, &targets, &available, "Saved ✓")
+                println!("Config saved: disks={:?}, targets={:?}, keep_last={}", disks, targets, keep_last);
+                page(&disks, &targets, keep_last, &available, "Saved ✓")
             };
 
             let _ = request.respond(
@@ -436,4 +458,4 @@ pub fn run() {
             );
         }
     }
-}   
+}
