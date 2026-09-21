@@ -1,8 +1,9 @@
-use tiny_http::{Server, Response, Header, Method};
+use tiny_http::{Server, Response, Header, Method, SslConfig};
+use std::io::Read;
 
 const CONFIG_PATH: &str = "/root/.config/vzdumper/config.yaml";
 const STATE_PATH: &str = "/run/vzdumper/state.json";
-const LISTEN_ADDR: &str = "0.0.0.0:8888";
+const LISTEN_ADDR: &str = "0.0.0.0:8889";
 
 fn read_disks() -> Vec<String> {
     match std::fs::read_to_string(CONFIG_PATH) {
@@ -413,9 +414,33 @@ function toggleTheme() {{
 </html>"#)
 }
 
+// ... read_disks(), write_disks(), read_state(), page() stay exactly the same ...
+
+fn load_ssl_config() -> SslConfig {
+    // Try pveproxy-ssl first (custom/ACME cert), fall back to pve-ssl (self-signed)
+    let (cert_path, key_path) = if std::path::Path::new("/etc/pve/local/pveproxy-ssl.pem").exists() {
+        ("/etc/pve/local/pveproxy-ssl.pem", "/etc/pve/local/pveproxy-ssl.key")
+    } else {
+        ("/etc/pve/local/pve-ssl.pem", "/etc/pve/local/pve-ssl.key")
+    };
+
+    let certificate = std::fs::read(cert_path).unwrap_or_else(|e| {
+        eprintln!("Failed to read cert {}: {}", cert_path, e);
+        std::process::exit(1);
+    });
+    let private_key = std::fs::read(key_path).unwrap_or_else(|e| {
+        eprintln!("Failed to read key {}: {}", key_path, e);
+        std::process::exit(1);
+    });
+
+    println!("Using TLS cert: {}", cert_path);
+    SslConfig { certificate, private_key }
+}
+
 pub fn run() {
-    let server = Server::http(LISTEN_ADDR).expect("failed to bind");
-    println!("GUI listening on http://{} (Ctrl+C to stop)", LISTEN_ADDR);
+    let ssl_config = load_ssl_config();
+    let server = Server::https(LISTEN_ADDR, ssl_config).expect("failed to bind HTTPS server");
+    println!("GUI listening on https://{} (Ctrl+C to stop)", LISTEN_ADDR);
 
     for mut request in server.incoming_requests() {
         let method = request.method().clone();
