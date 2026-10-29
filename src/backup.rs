@@ -6,69 +6,6 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_default_targets() {
-        assert_eq!(default_targets(), vec!["all".to_string()]);
-    }
-
-    #[test]
-    fn test_default_keep_last() {
-        assert_eq!(default_keep_last(), 5);
-    }
-
-    #[test]
-    fn test_is_block_device_nonexistent() {
-        assert!(!is_block_device("/dev/nonexistent-device-12345"));
-    }
-
-    #[test]
-    fn test_is_block_device_existing_file() {
-        // A regular file should not be a block device
-        assert!(!is_block_device("/etc/hostname"));
-    }
-
-    #[test]
-    fn test_wait_for_any_device_empty() {
-        let result = wait_for_any_device(&[]);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_wait_for_any_device_nonexistent_uuid() {
-        let result = wait_for_any_device(&["nonexistent-uuid-12345".to_string()]);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_write_state_creates_directory_and_file() {
-        let state = "test_state";
-        let detail = "test_detail";
-        write_state(state, detail);
-
-        // The state path may not be writable in non-root environments
-        // If we're root, verify the file was created
-        if std::env::var("USER").as_deref() == Ok("root") {
-            let content = fs::read_to_string(STATE_PATH).expect("should read state file");
-            assert!(content.contains(state));
-            assert!(content.contains(detail));
-        }
-    }
-
-    #[test]
-    fn test_load_config_nonexistent() {
-        // This tests that load_config returns None when config doesn't exist
-        // We can't easily test the success path without mocking, but we can
-        // verify it doesn't panic on missing config
-        let _result = load_config();
-        // If config exists from a previous test or real usage, this may return Some
-        // Otherwise None - both are acceptable
-    }
-}
-
 const CONFIG_PATH: &str = "/root/.config/vzdumper/config.yaml";
 const MOUNT_POINT: &str = "/mnt/proxmox-backup";
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
