@@ -1,5 +1,89 @@
 use tiny_http::{Server, Response, Header, Method, SslConfig};
-use std::io::Read;
+use std::time::{Duration, UNIX_EPOCH};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_time_ago_zero() {
+        assert_eq!(time_ago(0), "—");
+    }
+
+    #[test]
+    fn test_time_ago_seconds() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let recent = now - 30; // 30 seconds ago
+        let result = time_ago(recent);
+        assert!(result.contains("s ago"), "Expected 's ago' in result, got: {}", result);
+    }
+
+    #[test]
+    fn test_time_ago_minutes() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let recent = now - 120; // 2 minutes ago
+        let result = time_ago(recent);
+        assert!(result.contains("m ago"), "Expected 'm ago' in result, got: {}", result);
+    }
+
+    #[test]
+    fn test_time_ago_hours() {
+        let result = time_ago(7200);
+        assert!(result.contains("h ago"));
+    }
+
+    #[test]
+    fn test_state_color() {
+        assert_eq!(state_color("backing_up"), "#e65100");
+        assert_eq!(state_color("waiting_for_device"), "#1565c0");
+        assert_eq!(state_color("error"), "#d32f2f");
+        assert_eq!(state_color("unknown"), "#424242");
+    }
+
+    #[test]
+    fn test_state_icon() {
+        assert_eq!(state_icon("backing_up"), "⏳");
+        assert_eq!(state_icon("waiting_for_device"), "💽");
+        assert_eq!(state_icon("error"), "⚠️");
+        assert_eq!(state_icon("unknown"), "❓");
+    }
+
+    #[test]
+    fn test_page_generates_html() {
+        let disks = vec!["test-uuid".to_string()];
+        let targets = vec!["all".to_string()];
+        let html = page(&disks, &targets, 5, &[], "");
+
+        assert!(html.contains("<!DOCTYPE html>"));
+        assert!(html.contains("vzdumper"));
+        assert!(html.contains("test-uuid"));
+        assert!(html.contains("Backup Disks"));
+        assert!(html.contains("Backup Targets"));
+    }
+
+    #[test]
+    fn test_page_with_available_targets() {
+        let available = vec!["100".to_string(), "101".to_string()];
+        let html = page(&vec![], &vec!["all".to_string()], 3, &available, "");
+
+        assert!(html.contains("100"));
+        assert!(html.contains("101"));
+        assert!(html.contains("3"));
+    }
+
+    #[test]
+    fn test_page_with_message() {
+        let html = page(&vec![], &vec!["all".to_string()], 5, &[], "Test message");
+        assert!(html.contains("Test message"));
+        assert!(html.contains("snackbar"));
+    }
+}
 
 const CONFIG_PATH: &str = "/root/.config/vzdumper/config.yaml";
 const STATE_PATH: &str = "/run/vzdumper/state.json";
@@ -291,7 +375,7 @@ body {{ font-family: 'Roboto', system-ui, sans-serif; background: var(--bg); col
 
 {msg_html}
 
-<div class="footer">Status updates every 5 s · Daemon picks up changes within ~10 s</div>
+<div class="footer">Status updates every 5 s · Daemon picks up changes within ~10 s · TLS: <span id="tls-status">checking…</span></div>
 
 </div>
 <script>
@@ -361,32 +445,82 @@ setInterval(async () => {{
     }}
   }} catch(e) {{}}
 }}, 5000);
+setInterval(async () => {{
+  try {{
+    const r = await fetch('/tls');
+    const d = await r.json();
+    const el = document.getElementById('tls-status');
+    if (d.tls_enabled) {{
+      el.innerHTML = '<span style="color:#2e7d32">✓ HTTPS</span>';
+    }} else {{
+      el.innerHTML = '<span style="color:#d32f2f">⚠ HTTP (no cert)</span>';
+    }}
+  }} catch(e) {{}}
+}}, 10000);
 </script>
 </body>
 </html>"#)
 }
 
-fn load_ssl_config() -> Option<SslConfig> {
-    let (cert_path, key_path) = if std::path::Path::new("/etc/pve/local/pveproxy-ssl.pem").exists() {
-        ("/etc/pve/local/pveproxy-ssl.pem", "/etc/pve/local/pveproxy-ssl.key")
-    } else if std::path::Path::new("/etc/pve/local/pve-ssl.pem").exists() {
-        ("/etc/pve/local/pve-ssl.pem", "/etc/pve/local/pve-ssl.key")
-    } else {
-        eprintln!("No TLS certificate found. Falling back to plain HTTP.");
-        return None;
-    };
+/// Returns (cert_path, key_path, cert_mtime) if certs are found.
+fn find_cert_files() -> Option<(&'static str, &'static str, u64)> {
+    let candidates = [
+        ("/etc/pve/local/pveproxy-ssl.pem", "/etc/pve/local/pveproxy-ssl.key"),
+        ("/etc/pve/local/pve-ssl.pem", "/etc/pve/local/pve-ssl.key"),
+    ];
+    for (cert, key) in &candidates {
+        if std::path::Path::new(cert).exists() && std::path::Path::new(key).exists() {
+            if let Ok(meta) = std::fs::metadata(cert) {
+                if let Ok(time) = meta.modified() {
+                    if let Ok(mtime) = time.duration_since(UNIX_EPOCH) {
+                        return Some((cert, key, mtime.as_secs()));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
 
-    let certificate = match std::fs::read(cert_path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Failed to read cert {}: {}. Falling back to plain HTTP.", cert_path, e);
+/// Like `find_cert_files`, but retries on failure.
+/// During startup or Proxmox filesystem operations, `/etc/pve`
+/// (a FUSE filesystem) can be briefly unavailable.
+fn find_cert_files_with_retry(attempts: usize, delay_secs: u64) -> Option<(&'static str, &'static str, u64)> {
+    for attempt in 0..attempts {
+        if let Some(result) = find_cert_files() {
+            return Some(result);
+        }
+        if attempt + 1 < attempts {
+            eprintln!("Cert files not found, retry {}/{} in {}s...",
+                attempt + 1, attempts, delay_secs);
+            std::thread::sleep(Duration::from_secs(delay_secs));
+        }
+    }
+    None
+}
+
+fn load_ssl_config() -> Option<SslConfig> {
+    let (cert_path, key_path) = match find_cert_files_with_retry(6, 5) {
+        Some((cert, key, _)) => (cert, key),
+        None => {
+            eprintln!("No TLS certificate found. Falling back to plain HTTP.");
             return None;
         }
     };
-    let private_key = match std::fs::read(key_path) {
-        Ok(k) => k,
-        Err(e) => {
-            eprintln!("Failed to read key {}: {}. Falling back to plain HTTP.", key_path, e);
+
+    // Retry reading certs — during startup or Proxmox filesystem operations,
+    // /etc/pve might be briefly unavailable.
+    let certificate = match retry_read_file(cert_path, 6, 5) {
+        Some(c) => c,
+        None => {
+            eprintln!("Failed to read cert {} after retries. Falling back to plain HTTP.", cert_path);
+            return None;
+        }
+    };
+    let private_key = match retry_read_file(key_path, 6, 5) {
+        Some(k) => k,
+        None => {
+            eprintln!("Failed to read key {} after retries. Falling back to plain HTTP.", key_path);
             return None;
         }
     };
@@ -395,16 +529,56 @@ fn load_ssl_config() -> Option<SslConfig> {
     Some(SslConfig { certificate, private_key })
 }
 
+/// Read a file, retrying on failure (for transient filesystem issues).
+fn retry_read_file(path: &str, attempts: usize, delay_secs: u64) -> Option<Vec<u8>> {
+    for attempt in 0..attempts {
+        match std::fs::read(path) {
+            Ok(data) => return Some(data),
+            Err(e) => {
+                eprintln!("Read attempt {} for {} failed: {}. Retrying in {}s...",
+                    attempt + 1, path, e, delay_secs);
+                std::thread::sleep(Duration::from_secs(delay_secs));
+            }
+        }
+    }
+    None
+}
+
 pub fn run() {
     let ssl_config = load_ssl_config();
+    let cert_mtime = find_cert_files().map(|(_, _, m)| m);
+
+    // Spawn a thread that watches for certificate file changes.
+    // If Proxmox rotates its TLS cert (e.g. during pveproxy restart),
+    // we restart this process so systemd picks up the new cert.
+    if let Some(mtime) = cert_mtime {
+        std::thread::spawn(move || {
+            let mut last_mtime = mtime;
+            loop {
+                std::thread::sleep(Duration::from_secs(30));
+                if let Some((_, _, new_mtime)) = find_cert_files() {
+                    if new_mtime != last_mtime {
+                        println!("Certificate file changed (mtime {} -> {}), restarting GUI...",
+                            last_mtime, new_mtime);
+                        std::process::exit(0);
+                    }
+                    last_mtime = new_mtime;
+                }
+            }
+        });
+    }
+
     let server = match &ssl_config {
         Some(config) => Server::https(LISTEN_ADDR, config.clone())
             .expect("failed to bind HTTPS server"),
-        None => Server::http(LISTEN_ADDR)
-            .expect("failed to bind HTTP server"),
+        None => {
+            eprintln!("WARNING: Running without TLS. Use a reverse proxy if exposing publicly.");
+            Server::http(LISTEN_ADDR)
+                .expect("failed to bind HTTP server")
+        }
     };
     let scheme = if ssl_config.is_some() { "https" } else { "http" };
-    println!("[install] GUI available at http(s)://<proxmox-ip>:8889");
+    println!("[install] GUI available at {}://<proxmox-ip>:8889", scheme);
     for mut request in server.incoming_requests() {
         let method = request.method().clone();
 
@@ -419,6 +593,25 @@ pub fn run() {
                 );
                 let _ = request.respond(
                     Response::from_string(json).with_header(
+                        Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap(),
+                    )
+                );
+                continue;
+            }
+
+            if url == "/tls" {
+                let tls_info = match &ssl_config {
+                    Some(_) => {
+                        let cert = find_cert_files().map(|(p, _, _)| p).unwrap_or("unknown");
+                        format!(
+                            "{{\"tls_enabled\":true,\"cert_path\":\"{}\",\"scheme\":\"https\"}}",
+                            cert
+                        )
+                    }
+                    None => "{\"tls_enabled\":false,\"cert_path\":null,\"scheme\":\"http\"}".to_string(),
+                };
+                let _ = request.respond(
+                    Response::from_string(tls_info).with_header(
                         Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap(),
                     )
                 );
