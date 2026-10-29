@@ -56,7 +56,7 @@ mod tests {
 
     #[test]
     fn test_page_generates_html() {
-        let disks = vec!["test-uuid".to_string()];
+        let disks = vec![("test-uuid".to_string(), None)];
         let targets = vec!["all".to_string()];
         let html = page(&disks, &targets, 5, &[], "");
 
@@ -89,7 +89,7 @@ const CONFIG_PATH: &str = "/root/.config/vzdumper/config.yaml";
 const STATE_PATH: &str = "/run/vzdumper/state.json";
 const LISTEN_ADDR: &str = "0.0.0.0:8889";
 
-fn read_config() -> (Vec<String>, Vec<String>, u32) {
+fn read_config() -> (Vec<(String, Option<String>)>, Vec<String>, u32) {
     let mut disks = Vec::new();
     let mut targets = vec!["all".to_string()];
     let mut keep_last: u32 = 5;
@@ -97,10 +97,25 @@ fn read_config() -> (Vec<String>, Vec<String>, u32) {
     if let Ok(content) = std::fs::read_to_string(CONFIG_PATH) {
         let v: serde_yaml::Value = serde_yaml::from_str(&content).unwrap_or_default();
         if let Some(seq) = v.get("disks").and_then(|d| d.as_sequence()) {
-            disks = seq.iter()
-                .filter_map(|item| item.as_str().map(|s| s.to_string()))
-                .filter(|s| !s.is_empty())
-                .collect();
+            for item in seq {
+                if let Some(s) = item.as_str() {
+                    if !s.is_empty() {
+                        disks.push((s.to_string(), None));
+                    }
+                } else if let Some(obj) = item.as_mapping() {
+                    let uuid = obj.get("uuid")
+                        .and_then(|u| u.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if !uuid.is_empty() {
+                        let label = obj.get("label")
+                            .and_then(|l| l.as_str())
+                            .map(|l| l.to_string())
+                            .filter(|l| !l.is_empty());
+                        disks.push((uuid, label));
+                    }
+                }
+            }
         }
         if let Some(t) = v.get("targets") {
             if let Some(s) = t.as_str() {
@@ -119,16 +134,22 @@ fn read_config() -> (Vec<String>, Vec<String>, u32) {
     (disks, targets, keep_last)
 }
 
-fn write_config(disks: &[String], targets: &[String], keep_last: u32) -> Result<(), String> {
+fn write_config(disks: &[(String, Option<String>)], targets: &[String], keep_last: u32) -> Result<(), String> {
     let dir = std::path::Path::new("/root/.config/vzdumper");
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let mut yaml = String::from("disks:\n");
-    for d in disks {
-        yaml.push_str(&format!("  - \"{}\"\n", d));
+    for (uuid, label) in disks {
+        if let Some(l) = label {
+            if !l.is_empty() {
+                yaml.push_str(&format!("  - uuid: \"{}\"\n    label: \"{}\"\n", uuid.replace('"', "\\\""), l.replace('"', "\\\"")));
+                continue;
+            }
+        }
+        yaml.push_str(&format!("  - \"{}\"\n", uuid.replace('"', "\\\"")));
     }
     yaml.push_str("targets:\n");
     for t in targets {
-        yaml.push_str(&format!("  - \"{}\"\n", t));
+        yaml.push_str(&format!("  - \"{}\"\n", t.replace('"', "\\\"")));
     }
     yaml.push_str(&format!("keep_last: {}\n", keep_last));
     std::fs::write(CONFIG_PATH, yaml).map_err(|e| e.to_string())
@@ -205,7 +226,25 @@ fn time_ago(time: u64) -> String {
     else { format!("{}h ago", dt / 3600) }
 }
 
-fn page(disks: &[String], targets: &[String], keep_last: u32, available: &[String], message: &str) -> String {
+fn url_decode(s: &str) -> String {
+    let mut result = String::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = u8::from_str_radix(&s[i+1..i+3], 16) {
+                result.push(hex as char);
+                i += 3;
+                continue;
+            }
+        }
+        result.push(bytes[i] as char);
+        i += 1;
+    }
+    result
+}
+
+fn page(disks: &[(String, Option<String>)], targets: &[String], keep_last: u32, available: &[String], message: &str) -> String {
     let (state, detail, time) = read_state();
     let s_color = state_color(&state);
     let s_icon = state_icon(&state);
@@ -213,10 +252,13 @@ fn page(disks: &[String], targets: &[String], keep_last: u32, available: &[Strin
     let all_selected = if targets.iter().any(|t| t == "all") { "selected" } else { "" };
 
     let mut disk_rows = String::new();
-    for d in disks.iter() {
+    for (uuid, label) in disks.iter() {
+        let label_val = label.as_deref().unwrap_or("");
+        let has_label = !label_val.is_empty();
+        let row_class = if has_label { "disk-row has-label" } else { "disk-row" };
         disk_rows.push_str(&format!(
-            r#"<div class="disk-row"><div class="input-container"><span class="input-label">UUID</span><input type="text" name="disk" value="{}" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"><div class="input-underline"></div></div><button type="button" class="icon-btn" onclick="this.closest('.disk-row').remove()" title="Remove">✕</button></div>"#,
-            d
+            r#"<div class="{}"><div style="flex:1"><div class="input-container"><span class="input-label">Label (optional)</span><input type="text" name="disk_label" value="{}" placeholder="My Backup Disk" oninput="toggleUuidVisibility(this)"><div class="input-underline"></div></div><div class="input-container uuid-container"><span class="input-label">UUID</span><input type="text" name="disk" value="{}" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"><div class="input-underline"></div></div></div><button type="button" class="icon-btn" onclick="this.closest('.disk-row').remove()" title="Remove">✕</button></div>"#,
+            row_class, label_val.replace('"', "&quot;"), uuid.replace('"', "&quot;")
         ));
     }
 
@@ -302,8 +344,10 @@ body {{ font-family: 'Roboto', system-ui, sans-serif; background: var(--bg); col
 .input-container input:focus {{ border-bottom-color: var(--input-focus); }}
 .input-underline {{ height: 2px; background: var(--input-focus); transform: scaleX(0); transition: transform .2s; }}
 .input-container input:focus ~ .input-underline {{ transform: scaleX(1); }}
-.disk-row {{ display: flex; align-items: flex-end; gap: 8px; }}
+.disk-row {{ display: flex; align-items: flex-start; gap: 8px; }}
 .disk-row .input-container {{ flex: 1; }}
+.uuid-container {{ overflow: hidden; transition: max-height .3s ease, opacity .3s ease, margin .3s ease; max-height: 80px; opacity: 1; }}
+.disk-row.has-label .uuid-container {{ max-height: 0; opacity: 0; margin-bottom: 0; pointer-events: none; }}
 .btn {{ display: inline-block; padding: 10px 24px; border: none; border-radius: 8px; font-size: .9rem; font-weight: 500; cursor: pointer; transition: background .2s, box-shadow .2s; }}
 .btn-primary {{ background: var(--btn-primary-bg); color: var(--btn-primary-text); box-shadow: 0 2px 4px rgba(25,118,210,.3); }}
 .btn-primary:hover {{ background: #1565c0; box-shadow: 0 4px 8px rgba(25,118,210,.4); }}
@@ -382,8 +426,16 @@ body {{ font-family: 'Roboto', system-ui, sans-serif; background: var(--bg); col
 function addDisk() {{
   const div = document.createElement('div');
   div.className = 'disk-row';
-  div.innerHTML = '<div class="input-container"><span class="input-label">UUID</span><input type="text" name="disk" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"><div class="input-underline"></div></div><button type="button" class="icon-btn" onclick="this.closest(\'.disk-row\').remove()">✕</button>';
+  div.innerHTML = '<div style="flex:1"><div class="input-container"><span class="input-label">Label (optional)</span><input type="text" name="disk_label" placeholder="My Backup Disk" oninput="toggleUuidVisibility(this)"><div class="input-underline"></div></div><div class="input-container uuid-container"><span class="input-label">UUID</span><input type="text" name="disk" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"><div class="input-underline"></div></div></div><button type="button" class="icon-btn" onclick="this.closest(\'.disk-row\').remove()">✕</button>';
   document.getElementById('disks').appendChild(div);
+}}
+function toggleUuidVisibility(input) {{
+  const row = input.closest('.disk-row');
+  if (input.value && input.value.trim() !== '') {{
+    row.classList.add('has-label');
+  }} else {{
+    row.classList.remove('has-label');
+  }}
 }}
 function toggleTarget(el, id) {{
   el.classList.toggle('selected');
@@ -630,16 +682,20 @@ pub fn run() {
             let mut body = String::new();
             let _ = request.as_reader().read_to_string(&mut body);
 
-            let mut disks = Vec::new();
+            let mut disk_uuids = Vec::new();
+            let mut disk_labels = Vec::new();
             let mut targets = Vec::new();
             let mut keep_last: u32 = 5;
             for pair in body.split('&') {
+                if pair.is_empty() { continue; }
                 let mut kv = pair.splitn(2, '=');
                 let k = kv.next().unwrap_or("");
                 let v = kv.next().unwrap_or("");
-                let v = v.replace('+', " ").trim().to_string();
-                if k == "disk" && !v.is_empty() {
-                    disks.push(v);
+                let v = url_decode(&v.replace('+', " ")).trim().to_string();
+                if k == "disk" {
+                    disk_uuids.push(v);
+                } else if k == "disk_label" {
+                    disk_labels.push(v);
                 } else if k == "target" && !v.is_empty() {
                     targets.push(v);
                 } else if k == "keep_last" {
@@ -647,6 +703,13 @@ pub fn run() {
                         keep_last = n.clamp(1, 99);
                     }
                 }
+            }
+
+            let mut disks = Vec::new();
+            for (i, uuid) in disk_uuids.iter().enumerate() {
+                if uuid.is_empty() { continue; }
+                let label = disk_labels.get(i).cloned().filter(|l| !l.is_empty());
+                disks.push((uuid.clone(), label));
             }
 
             let available = get_available_targets();

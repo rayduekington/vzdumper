@@ -77,13 +77,37 @@ const SERVICE_PATH: &str = "/etc/systemd/system/vzdumper.service";
 const GUI_SERVICE_PATH: &str = "/etc/systemd/system/vzdumper-gui.service";
 const STATE_PATH: &str = "/run/vzdumper/state.json";
 
+#[derive(Deserialize, Clone, Debug)]
+#[serde(untagged)]
+enum DiskEntry {
+    Uuid(String),
+    WithLabel { uuid: String, #[serde(default)] _label: Option<String> },
+}
+
 #[derive(Deserialize)]
 struct Config {
-    disks: Vec<String>,
+    #[serde(default)]
+    disks: Vec<DiskEntry>,
     #[serde(default = "default_targets")]
     targets: Vec<String>,
     #[serde(default = "default_keep_last")]
     keep_last: u32,
+}
+
+impl Config {
+    fn get_disk_uuids(&self) -> Vec<String> {
+        self.disks
+            .iter()
+            .filter_map(|d| match d {
+                DiskEntry::Uuid(s) => {
+                    if s.is_empty() { None } else { Some(s.clone()) }
+                }
+                DiskEntry::WithLabel { uuid, .. } => {
+                    if uuid.is_empty() { None } else { Some(uuid.clone()) }
+                }
+            })
+            .collect()
+    }
 }
 
 fn default_targets() -> Vec<String> {
@@ -100,7 +124,7 @@ fn load_config() -> Option<Config> {
         Err(_) => return None,
     };
     match serde_yaml::from_str::<Config>(&content) {
-        Ok(cfg) if !cfg.disks.is_empty() => Some(cfg),
+        Ok(cfg) if !cfg.get_disk_uuids().is_empty() => Some(cfg),
         _ => None,
     }
 }
@@ -230,16 +254,18 @@ pub fn run() {
     println!("vzdumper started. Waiting for valid config ...");
     let config = loop {
         if let Some(cfg) = load_config() {
-            println!("Config loaded: {} disk(s), targets: {:?}, keep_last: {}", cfg.disks.len(), cfg.targets, cfg.keep_last);
+            let uuids = cfg.get_disk_uuids();
+            println!("Config loaded: {} disk(s), targets: {:?}, keep_last: {}", uuids.len(), cfg.targets, cfg.keep_last);
             break cfg;
         }
         thread::sleep(Duration::from_secs(10));
     };
 
     loop {
-        write_state("waiting_for_device", &config.disks.join(", "));
+        let disk_uuids = config.get_disk_uuids();
+        write_state("waiting_for_device", &disk_uuids.join(", "));
         let device = loop {
-            if let Some(d) = wait_for_any_device(&config.disks) {
+            if let Some(d) = wait_for_any_device(&disk_uuids) {
                 break d;
             }
             thread::sleep(POLL_INTERVAL);
