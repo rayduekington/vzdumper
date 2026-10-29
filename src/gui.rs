@@ -257,7 +257,7 @@ fn page(disks: &[(String, Option<String>)], targets: &[String], keep_last: u32, 
         let has_label = !label_val.is_empty();
         let row_class = if has_label { "disk-row has-label" } else { "disk-row" };
         disk_rows.push_str(&format!(
-            r#"<div class="{}"><div style="flex:1"><div class="input-container"><span class="input-label">Label (optional)</span><input type="text" name="disk_label" value="{}" placeholder="My Backup Disk" oninput="toggleUuidVisibility(this)"><div class="input-underline"></div></div><div class="input-container uuid-container"><span class="input-label">UUID</span><input type="text" name="disk" value="{}" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"><div class="input-underline"></div></div></div><button type="button" class="icon-btn" onclick="this.closest('.disk-row').remove()" title="Remove">✕</button></div>"#,
+            r#"<div class="{}"><div style="flex:1"><div class="input-container"><input type="text" name="disk_label" value="{}" placeholder="Disk" oninput="toggleUuidVisibility(this)"><div class="input-underline"></div></div><div class="input-container uuid-container"><input type="text" name="disk" value="{}" placeholder="UUID"><div class="input-underline"></div></div></div><button type="button" class="icon-btn" onclick="toggleShowUuid(this)" title="Show/Hide UUID">👁</button><button type="button" class="icon-btn" onclick="this.closest('.disk-row').remove()" title="Remove">✕</button></div>"#,
             row_class, label_val.replace('"', "&quot;"), uuid.replace('"', "&quot;")
         ));
     }
@@ -345,9 +345,10 @@ body {{ font-family: 'Roboto', system-ui, sans-serif; background: var(--bg); col
 .input-underline {{ height: 2px; background: var(--input-focus); transform: scaleX(0); transition: transform .2s; }}
 .input-container input:focus ~ .input-underline {{ transform: scaleX(1); }}
 .disk-row {{ display: flex; align-items: flex-start; gap: 8px; }}
-.disk-row .input-container {{ flex: 1; }}
-.uuid-container {{ overflow: hidden; transition: max-height .3s ease, opacity .3s ease, margin .3s ease; max-height: 80px; opacity: 1; }}
-.disk-row.has-label .uuid-container {{ max-height: 0; opacity: 0; margin-bottom: 0; pointer-events: none; }}
+.disk-row .input-container {{ flex: 1; margin-bottom: 20px; }}
+.uuid-container {{ overflow: hidden; transition: max-height .3s ease, opacity .3s ease; max-height: 80px; opacity: 1; margin-bottom: 20px; }}
+.disk-row.has-label .uuid-container {{ max-height: 0; opacity: 0; margin-bottom: 0; padding-top: 0; padding-bottom: 0; pointer-events: none; }}
+.disk-row.has-label.force-show-uuid .uuid-container {{ max-height: 80px; opacity: 1; margin-bottom: 20px; pointer-events: auto; }}
 .btn {{ display: inline-block; padding: 10px 24px; border: none; border-radius: 8px; font-size: .9rem; font-weight: 500; cursor: pointer; transition: background .2s, box-shadow .2s; }}
 .btn-primary {{ background: var(--btn-primary-bg); color: var(--btn-primary-text); box-shadow: 0 2px 4px rgba(25,118,210,.3); }}
 .btn-primary:hover {{ background: #1565c0; box-shadow: 0 4px 8px rgba(25,118,210,.4); }}
@@ -426,7 +427,7 @@ body {{ font-family: 'Roboto', system-ui, sans-serif; background: var(--bg); col
 function addDisk() {{
   const div = document.createElement('div');
   div.className = 'disk-row';
-  div.innerHTML = '<div style="flex:1"><div class="input-container"><span class="input-label">Label (optional)</span><input type="text" name="disk_label" placeholder="My Backup Disk" oninput="toggleUuidVisibility(this)"><div class="input-underline"></div></div><div class="input-container uuid-container"><span class="input-label">UUID</span><input type="text" name="disk" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"><div class="input-underline"></div></div></div><button type="button" class="icon-btn" onclick="this.closest(\'.disk-row\').remove()">✕</button>';
+  div.innerHTML = '<div style="flex:1"><div class="input-container"><input type="text" name="disk_label" placeholder="Disk" oninput="toggleUuidVisibility(this)"><div class="input-underline"></div></div><div class="input-container uuid-container"><input type="text" name="disk" placeholder="UUID"><div class="input-underline"></div></div></div><button type="button" class="icon-btn" onclick="toggleShowUuid(this)" title="Show/Hide UUID">👁</button><button type="button" class="icon-btn" onclick="this.closest(\'.disk-row\').remove()" title="Remove">✕</button>';
   document.getElementById('disks').appendChild(div);
 }}
 function toggleUuidVisibility(input) {{
@@ -436,6 +437,10 @@ function toggleUuidVisibility(input) {{
   }} else {{
     row.classList.remove('has-label');
   }}
+}}
+function toggleShowUuid(btn) {{
+  const row = btn.closest('.disk-row');
+  row.classList.toggle('force-show-uuid');
 }}
 function toggleTarget(el, id) {{
   el.classList.toggle('selected');
