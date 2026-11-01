@@ -4,7 +4,7 @@ Automatic Proxmox VE backup tool that triggers backups when a specific removable
 
 ## Overview
 
-**TL;DR:** download release to proxmox, `chmod +x vzdumper` and then run `./vzdumper --install`. You can configure the application theough webinterface on *https://<proxmox-ip>:8889*.
+**TL;DR:** download release to proxmox, `chmod +x vzdumper` and then run `./vzdumper --install`. You can configure the application theough webinterface on *https://proxmox-ip:8889*.
 
 `vzdumper` watches for a configured USB/external disk (by UUID), mounts it when detected, runs `vzdump` to back up selected Proxmox VMs and containers, prunes old backups, and waits for the disk to be removed before returning to standby. It includes a web-based GUI for configuration and real-time status monitoring.
 
