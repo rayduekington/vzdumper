@@ -1,10 +1,10 @@
 # vzdumper
 
-**TL;DR:** Plug in a configured disk → automatic Proxmox VM/CT backup to that disk → unplug to stop. Configure via web GUI. Could be, that the service needs a restart after configuring first time.
-
 Automatic Proxmox VE backup tool that triggers backups when a specific removable disk is inserted.
 
 ## Overview
+
+**TL;DR:** download release to proxmox, `chmod +x vzdumper` and then run `./vzdumper --install`. You can configure the application theough webinterface on *https://<proxmox-ip>:8889*.
 
 `vzdumper` watches for a configured USB/external disk (by UUID), mounts it when detected, runs `vzdump` to back up selected Proxmox VMs and containers, prunes old backups, and waits for the disk to be removed before returning to standby. It includes a web-based GUI for configuration and real-time status monitoring.
 
